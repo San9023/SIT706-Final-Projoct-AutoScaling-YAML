@@ -1,0 +1,480 @@
+Parameters:
+  Ec2InstanceProfile:
+    Description: "Instance Profile ARN"
+    Type: String
+    Default: "Enter Instance Profile ARN for EC2"
+
+Mappings:
+  Azones:
+    Z1:
+      Name: "us-east-1a"
+    Z2:
+      Name: "us-east-1b"
+    Z3:
+      Name: "us-east-1c"
+
+  # IPConfig:
+
+  #   WebVm1A:
+  #     CIDR: "10.156.132.10"
+  #   AppsVM1A:
+  #     CIDR: "10.156.136.11"
+  #   DeployVm1A:
+  #     CIDR: "10.156.136.20"
+  #   WeatherVM1A:
+  #     CIDR: "10.156.136.30"
+
+# ====================================Session Manager Role ===============================================
+Resources:
+  # SessionManagerRole:
+  #   Type: 'AWS::IAM::Role'
+  #   Properties:
+  #     RoleName: Rfs-Dev-SessionManagerRole
+  #     AssumeRolePolicyDocument:
+  #       Version: 2012-10-17
+  #       Statement:
+  #         - Effect: Allow
+  #           Principal:
+  #             Service:
+  #               - ec2.amazonaws.com
+  #           Action: 'sts:AssumeRole'
+  #     Path: /
+  #     ManagedPolicyArns:
+  #       - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+  #       - arn:aws:iam::aws:policy/AmazonSSMDirectoryServiceAccess
+  #     Policies:
+  #       - PolicyName: "SessionManager-Policy"
+  #         PolicyDocument:
+  #           Version: 2012-10-17
+  #           Statement:
+  #             - Effect: Allow
+  #               Action:
+  #                 - 'ssm:UpdateInstanceInformation'
+  #                 - 'ssmmessages:CreateControlChannel'
+  #                 - 'ssmmessages:CreateDataChannel'
+  #                 - 'ssmmessages:OpenControlChannel'
+  #                 - 'ssmmessages:OpenDataChannel'
+  #               Resource: '*'
+  #             - Effect: Allow
+  #               Action:
+  #                 - 's3:GetEncryptionConfiguration'
+  #               Resource: '*'
+
+  # =============================================Instance Profile====================================
+  # EC2InstanceProfile:
+  #   Type: "AWS::IAM::InstanceProfile"
+  #   Properties:
+  #     Path: "/"
+  #     Roles:
+  #       -
+  #         Ref: "SessionManagerRole"
+  Secret:
+    Type: "AWS::SecretsManager::Secret"
+    Properties:
+      Name: rds
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: "password"
+        PasswordLength: 30
+        ExcludeCharacters: '"@/\'
+  SecretResourcePolicy:
+    #Condition: HasDeletionProtection
+    Type: "AWS::SecretsManager::ResourcePolicy"
+    Properties:
+      SecretId: !Ref Secret
+      ResourcePolicy:
+        Version: "2012-10-17"
+        Statement:
+          - Resource: "*"
+            Action: "secretsmanager:DeleteSecret"
+            Effect: Deny
+            Principal:
+              AWS: !Sub "arn:aws:iam::${AWS::AccountId}:root"
+
+  # RDSIAMRole:
+  #   Type: "AWS::IAM::Role"
+  #   Properties:
+  #     Path: "/"
+  #     RoleName: "rds-monitoring-role"
+  #     AssumeRolePolicyDocument: "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"\",\"Effect\":\"Allow\",\"Principal\":{\"Service\":\"monitoring.rds.amazonaws.com\"},\"Action\":\"sts:AssumeRole\"}]}"
+  #     MaxSessionDuration: 3600
+  #     ManagedPolicyArns:
+  #     - "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+  #     Description: "To run RDS enhanced monitoring"
+  SecretTargetAttachment:
+    #DependsOn: AppDB
+    Type: "AWS::SecretsManager::SecretTargetAttachment"
+    Properties:
+      TargetId: !Ref AppDB
+      SecretId: !Ref Secret
+      TargetType: "AWS::RDS::DBInstance"
+  DatabaseSecurityGroup:
+    Type: "AWS::EC2::SecurityGroup"
+    Properties:
+      GroupDescription: !Ref "AWS::StackName"
+      VpcId: !ImportValue ExportFLVpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !ImportValue ExportEC2SG
+
+  DBSubnetGroup:
+    Type: "AWS::RDS::DBSubnetGroup"
+    Properties:
+      DBSubnetGroupDescription: "Private subnet group"
+      #SubnetIds: !Split [',', !Join [',', !Ref SubnetName]]
+      SubnetIds:
+        [
+          !ImportValue ExportFLPrivateSubnetA,
+          !ImportValue ExportFLPrivateSubnetB,
+        ]
+  AppDB:
+    Type: "AWS::RDS::DBInstance"
+    Properties:
+      AllowMajorVersionUpgrade: false
+      AutoMinorVersionUpgrade: true
+      BackupRetentionPeriod: "7"
+      CopyTagsToSnapshot: true
+      #AvailabilityZone: !FindInMap [Azones,Z1,Name]
+      DBInstanceIdentifier: "FLmysql"
+      DBName: "myFLdb"
+      DeletionProtection: "false"
+      DBInstanceClass: "db.t3.micro"
+      AllocatedStorage: "20"
+      MaxAllocatedStorage: "100"
+      Engine: "mysql"
+      EngineVersion: "8.0.28"
+      #LicenseModel: "license-included"
+      StorageType: "gp2"
+      MultiAZ: "true"
+      MasterUsername: "admin"
+      #MasterUserPassword: !Ref DBPassword
+      MasterUserPassword:
+        !Join [
+          ":",
+          ["{{resolve:secretsmanager", rds, "SecretString:password}}"],
+        ]
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      #KmsKeyId: {'Fn::ImportValue': 'KeyId'}
+      # MonitoringInterval: '60'
+      # MonitoringRoleArn: !GetAtt RDSIAMRole.Arn
+
+  ReplicaDB:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: "db.t3.micro"
+      AvailabilityZone: !FindInMap [Azones, Z2, Name]
+      SourceDBInstanceIdentifier: !Ref AppDB
+      MaxAllocatedStorage: "100"
+      MultiAZ: "false"
+      PubliclyAccessible: false
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      Tags:
+        - Key: Name
+          Value: webserver-readreplica
+
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: "ALBWebServer"
+      Scheme: internet-facing
+      Subnets:
+        - !ImportValue ExportFLPublicSubnetA
+        - !ImportValue ExportFLPublicSubnetB
+
+      SecurityGroups:
+        - !ImportValue ExportFLELB-SG
+      Type: application
+      Tags:
+        - Key: "Application"
+          Value:
+            Ref: "AWS::StackName"
+        - Key: "Network"
+          Value: "Public"
+        - Key: "Name"
+          Value: "Application Load balancer"
+
+  ExtALBHttpsListener443:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref ElasticLoadBalancingV2TargetGroup
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+
+  AutoScalingGroup:
+    Type: "AWS::AutoScaling::AutoScalingGroup"
+    Properties:
+      AutoScalingGroupName: "ASG-WebServer"
+      LaunchTemplate:
+        LaunchTemplateId: !Ref EC2LaunchTemplate
+        #LaunchTemplateName: "RFSLaunchTemplate"
+        Version: !GetAtt EC2LaunchTemplate.LatestVersionNumber
+      MinSize: 1
+      MaxSize: 3
+      DesiredCapacity: 1
+      Cooldown: 300
+      AvailabilityZones:
+        - !Sub "${AWS::Region}b"
+        - !Sub "${AWS::Region}a"
+        #- !Sub "${AWS::Region}c"
+      TargetGroupARNs:
+        #- !Ref ElasticLoadBalancingV2TargetGroup
+        - !Ref ElasticLoadBalancingV2TargetGroup
+      HealthCheckType: "EC2"
+      HealthCheckGracePeriod: 300
+      VPCZoneIdentifier:
+        - !ImportValue ExportFLPrivateSubnetA
+        - !ImportValue ExportFLPrivateSubnetB
+      TerminationPolicies:
+        - "Default"
+      ServiceLinkedRoleARN: "arn:aws:iam::655446323835:role/aws-service-role/autoscaling.amazonaws.com/AWSServiceRoleForAutoScaling"
+      MetricsCollection:
+        - Granularity: "1Minute"
+          Metrics:
+            - "GroupInServiceCapacity"
+            - "GroupMinSize"
+            - "WarmPoolDesiredCapacity"
+            - "GroupAndWarmPoolTotalCapacity"
+            - "GroupStandbyCapacity"
+            - "WarmPoolPendingCapacity"
+            - "GroupTerminatingCapacity"
+            - "WarmPoolTotalCapacity"
+            - "GroupTotalInstances"
+            - "GroupInServiceInstances"
+            - "GroupPendingInstances"
+            - "GroupStandbyInstances"
+            - "WarmPoolMinSize"
+            - "WarmPoolTerminatingCapacity"
+            - "WarmPoolWarmedCapacity"
+            - "GroupAndWarmPoolDesiredCapacity"
+            - "GroupTerminatingInstances"
+            - "GroupTotalCapacity"
+            - "GroupDesiredCapacity"
+            - "GroupPendingCapacity"
+            - "GroupMaxSize"
+      NewInstancesProtectedFromScaleIn: false
+      Tags:
+        - Key: Name
+          PropagateAtLaunch: true
+          Value: ASG-WebServer
+
+  AutoScalingScalingPolicy:
+    Type: "AWS::AutoScaling::ScalingPolicy"
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: "TargetTrackingScaling"
+      EstimatedInstanceWarmup: 60
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: "ASGAverageCPUUtilization"
+        TargetValue: 75
+        DisableScaleIn: false
+
+  EC2LaunchTemplate:
+    Type: "AWS::EC2::LaunchTemplate"
+    Properties:
+      LaunchTemplateName: "LaunchTemplate1"
+      LaunchTemplateData:
+        #KeyName: "ryanAFtest"
+        TagSpecifications:
+          - ResourceType: "instance"
+            Tags:
+              - Key: "mylaunchtemplate"
+                Value: "true"
+        BlockDeviceMappings:
+          - DeviceName: "/dev/sda1"
+            Ebs:
+              Encrypted: true
+              DeleteOnTermination: false
+              #SnapshotId: "snap-010663acf16d510c6"
+              VolumeSize: 20
+              VolumeType: "gp2"
+        IamInstanceProfile:
+          Arn: !Ref Ec2InstanceProfile
+        KeyName: "FL_Key-pair"
+        DisableApiTermination: false
+        ImageId: "ami-0e5e7d6c2f4177654"
+        InstanceType: "t2.micro"
+        SecurityGroupIds: !Split [",", !ImportValue ExportEC2SG]
+
+  ElasticLoadBalancingV2TargetGroup:
+    Type: "AWS::ElasticLoadBalancingV2::TargetGroup"
+    Properties:
+      HealthCheckIntervalSeconds: 15
+      #HealthCheckPath: "/"
+      Port: 80
+      Protocol: "HTTP"
+      HealthCheckPort: "80"
+      HealthCheckProtocol: "HTTP"
+      HealthCheckTimeoutSeconds: 5
+      UnhealthyThresholdCount: 3
+      TargetType: "instance"
+      Matcher:
+        HttpCode: "200-499"
+      HealthyThresholdCount: 3
+      VpcId: !ImportValue ExportFLVpcId
+      Name: "ALB-WebServers"
+      HealthCheckEnabled: true
+      TargetGroupAttributes:
+        # -
+        #   Key: "stickiness.enabled"
+        #   Value: "false"
+        - Key: "deregistration_delay.timeout_seconds"
+          Value: "300"
+        # -
+        #   Key: "stickiness.app_cookie.cookie_name"
+        #   Value: ""
+        # -
+        #   Key: "stickiness.type"
+        #   Value: "lb_cookie"
+        # -
+        #   Key: "stickiness.lb_cookie.duration_seconds"
+        #   Value: "86400"
+        # -
+        #   Key: "slow_start.duration_seconds"
+        #   Value: "0"
+        # -
+        #   Key: "stickiness.app_cookie.duration_seconds"
+        #   Value: "86400"
+        - Key: "load_balancing.algorithm.type"
+          Value: "round_robin"
+      # Targets:
+      #   -
+      #     Id: "i-0d6ea42b294807a5d"
+      #     Port: 80
+
+  # AutoScalingServiceRole:
+  #   Type: 'AWS::IAM::Role'
+  #   Properties:
+  #     RoleName: AutoScalingServiceRole
+  #     AssumeRolePolicyDocument:
+  #       Version: 2012-10-17
+  #       Statement:
+  #         - Effect: Allow
+  #           Principal:
+  #             Service:
+  #               - autoscaling.amazonaws.com
+  #           Action: 'sts:AssumeRole'
+  #     Path: /
+  #     ManagedPolicyArns:
+  #       - !Ref asgIAMManagedPolicy
+
+  # asgIAMManagedPolicy:
+  #   Type: "AWS::IAM::ManagedPolicy"
+  #   Properties:
+  #     ManagedPolicyName: "rfs-autoscaling-policy"
+  #     Path: "/"
+  #     PolicyDocument: |
+  #       {
+  #         "Version": "2012-10-17",
+  #         "Statement": [
+  #           {
+  #             "Sid": "EC2InstanceManagement",
+  #             "Effect": "Allow",
+  #             "Action": [
+  #                 "ec2:AttachClassicLinkVpc",
+  #                 "ec2:CancelSpotInstanceRequests",
+  #                 "ec2:CreateFleet",
+  #                 "ec2:CreateTags",
+  #                 "ec2:DeleteTags",
+  #                 "ec2:Describe*",
+  #                 "ec2:DetachClassicLinkVpc",
+  #                 "ec2:ModifyInstanceAttribute",
+  #                 "ec2:RequestSpotInstances",
+  #                 "ec2:RunInstances",
+  #                 "ec2:StartInstances",
+  #                 "ec2:StopInstances",
+  #                 "ec2:TerminateInstances"
+  #             ],
+  #             "Resource": "*"
+  #           },
+  #           {
+  #             "Sid": "EC2InstanceProfileManagement",
+  #             "Effect": "Allow",
+  #             "Action": [
+  #                 "iam:PassRole"
+  #             ],
+  #             "Resource": "*",
+  #             "Condition": {
+  #                 "StringLike": {
+  #                     "iam:PassedToService": "ec2.amazonaws.com*"
+  #                 }
+  #             }
+  #           },
+  #           {
+  #             "Sid": "EC2SpotManagement",
+  #             "Effect": "Allow",
+  #             "Action": [
+  #                 "iam:CreateServiceLinkedRole"
+  #             ],
+  #             "Resource": "*",
+  #             "Condition": {
+  #                 "StringEquals": {
+  #                     "iam:AWSServiceName": "spot.amazonaws.com"
+  #                 }
+  #             }
+  #         },
+  #         {
+  #           "Sid": "ELBManagement",
+  #           "Effect": "Allow",
+  #           "Action": [
+  #               "elasticloadbalancing:Register*",
+  #               "elasticloadbalancing:Deregister*",
+  #               "elasticloadbalancing:Describe*"
+  #           ],
+  #           "Resource": "*"
+  #         },
+  #         {
+  #           "Sid": "CWManagement",
+  #           "Effect": "Allow",
+  #           "Action": [
+  #               "cloudwatch:DeleteAlarms",
+  #               "cloudwatch:DescribeAlarms",
+  #               "cloudwatch:GetMetricData",
+  #               "cloudwatch:PutMetricAlarm"
+  #           ],
+  #           "Resource": "*"
+  #         },
+  #         {
+  #           "Sid": "SNSManagement",
+  #           "Effect": "Allow",
+  #           "Action": [
+  #               "sns:Publish"
+  #           ],
+  #           "Resource": "*"
+  #         },
+  #         {
+  #           "Sid": "EventBridgeRuleManagement",
+  #           "Effect": "Allow",
+  #           "Action": [
+  #               "events:PutRule",
+  #               "events:PutTargets",
+  #               "events:RemoveTargets",
+  #               "events:DeleteRule",
+  #               "events:DescribeRule"
+  #           ],
+  #           "Resource": "*",
+  #           "Condition": {
+  #               "StringEquals": {
+  #                   "events:ManagedBy": "autoscaling.amazonaws.com"
+  #               }
+  #           }
+  #         },
+  #         {
+  #           "Sid": "SystemsManagerParameterManagement",
+  #           "Effect": "Allow",
+  #           "Action": [
+  #               "ssm:GetParameters"
+  #           ],
+  #           "Resource": "*"
+  #         }
+  #        ]
+  #       }
